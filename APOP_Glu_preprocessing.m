@@ -6,18 +6,19 @@
 % ICLabel thresholds
 
 % takes raw data and performs the following preprocessing steps:
-% 1. Load raw BrainVision data (BIDS layout from bidsify_apop_glu.py)
-% 2. Identify EOG channels by label (aux channels '31'/'32'), not by index
-% 3. Resample to 1000 Hz (raw data must already be >= 1000 Hz)
-% 4. Filter: 80 Hz lowpass, 0.5 Hz highpass
-% 5. Line noise removal: Zapline-plus + CleanLine (50 Hz)
-% 6. clean_rawdata: reject channels/segments, ASR-correct bursts (its own
-%    highpass is disabled -- the explicit 0.5 Hz filter above is the only
-%    highpass applied, so the data isn't filtered twice)
-% 7. ICA (extended infomax) + ICLabel, remove flagged components
-% 8. Interpolate EEG channels back to the full pre-clean_rawdata set
-% 9. Re-reference to average (FCz recovered); EOG channels are excluded
-%    from the reference computation
+%  1. Load raw BrainVision data (BIDS layout from bidsify_apop_glu.py)
+%  2. Identify EOG channels by label (aux channels '31'/'32'), not by index
+%  3. Resample to 1000 Hz (raw data must already be >= 1000 Hz)
+%  4. Filter: 80 Hz lowpass, 0.5 Hz highpass (EOG channels included)
+%  5. Split the EOG channels off. 
+%  6. Line noise removal: Zapline-plus + CleanLine (50 Hz)
+%  7. clean_rawdata
+%  8. ICA (extended infomax) + ICLabel, remove flagged components.
+%  9. EOG QC: correlations between the EOG traces and the ICs / the EEG
+%     before and after component removal
+% 10. Interpolate EEG channels back to the full pre-clean_rawdata set
+% 11. Re-reference to average (FCz recovered)
+% 12. Re-append the EOG channels to the saved dataset 
 %
 % Per-file design variables:
 %   PrePost  -- 'pre' / 'post' (acq- entity in the filename)
@@ -26,6 +27,18 @@
 %                      anything without a unique match is flagged 'undefined'
 % All four are written to the log file and to EEG.etc of each saved dataset.
 %
+% EOG QC columns in the log:
+%   EOG_Corr_Before / EOG_Corr_After -- largest |r| between any EEG channel
+%       and any EOG channel, before and after IC removal. After should be
+%       clearly lower than before.
+%   Max_IC_EOG_Corr    -- largest |r| between ANY IC and an EOG channel
+%   Max_EyeIC_EOG_Corr -- largest |r| among the ICs ICLabel called 'eye'
+%       If Max_IC_EOG_Corr is high but Max_EyeIC_EOG_Corr is low or NaN,
+%       ICLabel missed an ocular component -- inspect that file.
+%   ICA_Rank -- rank of the data entering ICA. If it is below EEG_Channels
+%       (ASR can reduce rank) the decomposition is over-parameterised and
+%       you may want 'pca', ICA_Rank in pop_runica.
+%
 % returns continuous, cleaned data
 
 %% Initialize
@@ -33,12 +46,15 @@ clear; clc;
 eeglabRoot  = "D:\Linus\MATLAB_applications\eeglab2026.0.0";
 ICLabelRoot = "D:\Linus\MATLAB_applications\eeglab2026.0.0\plugins\ICLabel";
 rawpath     = "D:\Linus\APOP_Glu\raw_BIDS";
-CondFile  = "D:\Linus\APOP_Glu\scripts\APOP_Glu_Conditions.csv";
 outpath     = "D:\Linus\Local\APOP\preprocessed_BIDS";
 
 % labels of EOG chans
 eogRawLabels = {'31', '32'};
 eogNewLabels = {'EOG_L', 'EOG_R'};
+
+% Keep the EOG channels in the saved dataset (as untouched reference traces)?
+% The QC columns are logged either way.
+keepEOGInOutput = true;
 
 if ~exist(outpath, 'dir')
     mkdir(outpath);
@@ -46,6 +62,13 @@ end
 
 % logfile
 LogFile = fullfile(outpath, 'APOP_Glu_preprocessing_log.csv');
+
+% condition/drug table (lives next to this script)
+scriptDir = fileparts(mfilename('fullpath'));
+if isempty(scriptDir)
+    scriptDir = pwd;   % running by-section: fall back to the current folder
+end
+CondFile = fullfile(scriptDir, 'APOP_Glu_Conditions.csv');
 
 %% Log setup
 % one struct per file, turned into a table row with struct2table.
@@ -70,12 +93,18 @@ logFieldDefaults = struct( ...
     'Removed_Seconds',      NaN, ...
     'Removed_Channels_N',   NaN, ...
     'Removed_Channels',     "", ...
+    'ICA_Channels',         NaN, ...
+    'ICA_Rank',             NaN, ...
     'Total_Removed_ICs',    NaN, ...
     'Eye_Rejected_ICs',     NaN, ...
     'Muscle_Rejected_ICs',  NaN, ...
     'Heart_Rejected_ICs',   NaN, ...
     'Line_Rejected_ICs',    NaN, ...
-    'Channel_Rejected_ICs', NaN);
+    'Channel_Rejected_ICs', NaN, ...
+    'EOG_Corr_Before',      NaN, ...
+    'EOG_Corr_After',       NaN, ...
+    'Max_IC_EOG_Corr',      NaN, ...
+    'Max_EyeIC_EOG_Corr',   NaN);
 
 if exist(LogFile, 'file')
     logData = readtable(LogFile, 'TextType', 'string', 'VariableNamingRule', 'preserve');
@@ -205,6 +234,9 @@ for iFile = 1:numel(files)
         EEG = eeg_checkset(EEG);
 
         eogChanIdx = find(strcmpi({EEG.chanlocs.type}, 'EOG'));
+        if isempty(eogChanIdx)
+            error('No EOG channels found in %s.', rawFile);
+        end
         logEntry.EEG_Channels = EEG.nbchan - numel(eogChanIdx);
         logEntry.EOG_Channels = numel(eogChanIdx);
 
@@ -218,12 +250,20 @@ for iFile = 1:numel(files)
         logEntry.Resampled_Srate = EEG.srate;
 
         %% filter
-        % lowpass at 80 Hz, highpass at 0.5 Hz (clean_rawdata's own highpass
-        % is disabled below, so the data is only highpassed once, here)
         EEG = pop_eegfiltnew(EEG, 'hicutoff', 80);
         EEG = pop_eegfiltnew(EEG, 'locutoff', 0.5);
 
-        % line noise removal
+        %% split off the EOG channels
+        % The EOG data is kept as a plain matrix and re-appended at the end.
+        eogData     = EEG.data(eogChanIdx, :);
+        eogChanlocs = EEG.chanlocs(eogChanIdx);
+        eogLabels   = {eogChanlocs.labels};
+        EEG         = pop_select(EEG, 'nochannel', eogChanIdx);
+        EEG         = eeg_checkset(EEG);
+        fprintf('  Split off %d EOG channel(s) (%s); %d EEG channels continue.\n', ...
+            numel(eogChanIdx), strjoin(eogLabels, ', '), EEG.nbchan);
+
+        %% line noise removal (EEG channels only)
         EEG = pop_zapline_plus(EEG, 'noisefreqs', 50, 'plotResults', 0);
         EEG = pop_cleanline(EEG, 'linefreqs', 50, 'plotfigures', 0);
 
@@ -247,6 +287,21 @@ for iFile = 1:numel(files)
             'WindowCriterionTolerances', '[-Inf 7]');
         EEG = eeg_checkset(EEG);
 
+        % keep the EOG traces sample-aligned with the EEG.
+        if isfield(EEG.etc, 'clean_sample_mask') && ~isempty(EEG.etc.clean_sample_mask)
+            sampleMask = logical(EEG.etc.clean_sample_mask(:))';
+            if numel(sampleMask) ~= size(eogData, 2)
+                error(['clean_sample_mask has %d entries but the EOG data has %d samples ' ...
+                       '-- cannot realign the EOG channels.'], ...
+                       numel(sampleMask), size(eogData, 2));
+            end
+            eogData = eogData(:, sampleMask);
+        end
+        if size(eogData, 2) ~= EEG.pnts
+            error('EOG data has %d samples but the EEG has %d after cleaning -- alignment lost.', ...
+                size(eogData, 2), EEG.pnts);
+        end
+
         % record post cleaning
         after_clean_points  = EEG.pnts;
         after_clean_seconds = EEG.pnts / EEG.srate;
@@ -264,14 +319,28 @@ for iFile = 1:numel(files)
         logEntry.Removed_Channels   = string(removed_chans_str);
 
         %% ICA & ICLabel 
+        % ASR can leave the data rank deficient; logged so it is visible.
+        logEntry.ICA_Channels = EEG.nbchan;
+        logEntry.ICA_Rank     = rank(double(EEG.data));
+        if logEntry.ICA_Rank < EEG.nbchan
+            warning('APOP:RankDeficient', ...
+                ['%s: rank %d < %d channels entering ICA. Consider ' ...
+                 '''pca'', %d in pop_runica.'], ...
+                rawFile, logEntry.ICA_Rank, EEG.nbchan, logEntry.ICA_Rank);
+        end
+
         EEG = pop_runica(EEG, 'extended', 1);
         EEG = pop_iclabel(EEG, 'default');
 
         % ICLabel class order: 1 brain, 2 muscle, 3 eye, 4 heart,
         %                      5 line noise, 6 channel noise, 7 other
-        % reject if > 0.5 for muscle, eye, heart, channel noise, or > 0.8 for line noise
         ic_probs = EEG.etc.ic_classification.ICLabel.classifications;
 
+        % mark if:  muscle > 50%,
+        %           eye > 50%,
+        %           heart > 50%,
+        %           line noise > 80%,
+        %           channel noise > 50%
         EEG = pop_icflag(EEG, [NaN NaN; ...
                     0.50 1;                 % muscle
                     0.50 1;                 % eye
@@ -296,9 +365,37 @@ for iFile = 1:numel(files)
         logEntry.Line_Rejected_ICs    = numel(line_rejICs);
         logEntry.Channel_Rejected_ICs = numel(channel_rejICs);
 
+        % EOG QC (before component removal)
+        % ICLabel does not look at the EOG channels, so they give an
+        % independent read on whether the ocular components were caught.
+        icaact  = EEG.icaweights * EEG.icasphere * double(EEG.data(EEG.icachansind, :));
+        R_ic    = corrMatrix(icaact, eogData);          % nIC x nEOG
+        maxPerIC = max(abs(R_ic), [], 2);
+        clear icaact R_ic;
+
+        logEntry.Max_IC_EOG_Corr = max(maxPerIC);
+        if ~isempty(eye_rejICs)
+            logEntry.Max_EyeIC_EOG_Corr = max(maxPerIC(eye_rejICs));
+        end
+        logEntry.EOG_Corr_Before = max(abs(corrMatrix(EEG.data, eogData)), [], 'all');
+
         % reject ICs
         if ~isempty(rejICs)
             EEG = pop_subcomp(EEG, rejICs, 0);
+        end
+
+        % EOG QC (after component removal)
+        logEntry.EOG_Corr_After = max(abs(corrMatrix(EEG.data, eogData)), [], 'all');
+        fprintf(['  EOG QC: EEG-EOG |r| %.2f -> %.2f | strongest IC-EOG |r| %.2f ' ...
+                 '(eye ICs: %.2f)\n'], ...
+            logEntry.EOG_Corr_Before, logEntry.EOG_Corr_After, ...
+            logEntry.Max_IC_EOG_Corr, logEntry.Max_EyeIC_EOG_Corr);
+        if logEntry.Max_IC_EOG_Corr >= 0.5 && ...
+                (isnan(logEntry.Max_EyeIC_EOG_Corr) || logEntry.Max_EyeIC_EOG_Corr < 0.5)
+            warning('APOP:MissedEyeIC', ...
+                ['%s: an IC correlates |r| = %.2f with the EOG but ICLabel flagged ' ...
+                 'no eye component that strong -- inspect this file.'], ...
+                rawFile, logEntry.Max_IC_EOG_Corr);
         end
 
         % wipe ICA metadata
@@ -313,22 +410,26 @@ for iFile = 1:numel(files)
         end
 
         %% interpolate chans
-        % Only  non-EOG channels are interpolated
-        original_eeg_chanlocs = original_chanlocs(~strcmpi({original_chanlocs.type}, 'EOG'));
-        EEG = pop_interp(EEG, original_eeg_chanlocs, 'spherical');
+        % EEG channels only
+        EEG = pop_interp(EEG, original_chanlocs, 'spherical');
         EEG = eeg_checkset(EEG);
 
         %% re-reference to avg. and recover active reference (FCz)
-        % EOG channels are excluded from the reference computation
-        eogChanIdx = find(strcmpi({EEG.chanlocs.type}, 'EOG'));
-
+        % Only EEG channels
         tmpl = readlocs(fullfile(eeglabRoot, 'plugins', 'dipfit', 'standard_BEM', 'elec', 'standard_1005.elc'));
         fcz_loc = tmpl(find(strcmpi({tmpl.labels}, 'FCz'), 1));
         if ~isfield(fcz_loc, 'type'), fcz_loc.type = ''; end
         if ~isfield(fcz_loc, 'ref'), fcz_loc.ref = ''; end
         if ~isfield(fcz_loc, 'urchan'), fcz_loc.urchan = []; end
 
-        EEG = pop_reref(EEG, [], 'refloc', fcz_loc, 'exclude', eogChanIdx);
+        EEG = pop_reref(EEG, [], 'refloc', fcz_loc);
+
+        %% re-append the EOG channels
+        % Filtered and cut to the same samples
+        if keepEOGInOutput
+            EEG = appendChannels(EEG, eogData, eogChanlocs);
+            EEG = eeg_checkset(EEG);
+        end
 
         %% save metadata 
         EEG.etc.subject_id          = char(logEntry.Subject_ID);
@@ -338,11 +439,17 @@ for iFile = 1:numel(files)
         EEG.etc.eye_state           = char(logEntry.EyeState);   % 'EO' / 'EC'
         EEG.etc.condition           = char(logEntry.Condition);  % drug condition 1-4, or 'undefined'
         EEG.etc.drug                = char(logEntry.Drug);       % drug name, or 'undefined'
-        EEG.etc.original_chanlocs   = original_chanlocs;
+        EEG.etc.original_chanlocs   = original_chanlocs;         % EEG channels before clean_rawdata
+        EEG.etc.eog_channels        = eogLabels;
+        EEG.etc.eog_processing      = ['filtered 0.5-80 Hz and cut to the retained ' ...
+                                       'samples only; excluded from zapline, clean_rawdata/ASR, ' ...
+                                       'ICA, interpolation and the average reference'];
         EEG.etc.removed_points      = logEntry.Removed_Points;
         EEG.etc.removed_seconds     = logEntry.Removed_Seconds;
         EEG.etc.removed_channels_n  = logEntry.Removed_Channels_N;
         EEG.etc.removed_channels    = char(logEntry.Removed_Channels);
+        EEG.etc.ica_channels        = logEntry.ICA_Channels;
+        EEG.etc.ica_rank            = logEntry.ICA_Rank;
         EEG.etc.rejected_ICs        = rejICs;
         EEG.etc.rejected_ICs_counts = struct( ...
             'total',   logEntry.Total_Removed_ICs, ...
@@ -351,6 +458,11 @@ for iFile = 1:numel(files)
             'heart',   logEntry.Heart_Rejected_ICs, ...
             'line',    logEntry.Line_Rejected_ICs, ...
             'channel', logEntry.Channel_Rejected_ICs);
+        EEG.etc.eog_qc              = struct( ...
+            'eeg_eog_corr_before', logEntry.EOG_Corr_Before, ...
+            'eeg_eog_corr_after',  logEntry.EOG_Corr_After, ...
+            'max_ic_eog_corr',     logEntry.Max_IC_EOG_Corr, ...
+            'max_eye_ic_eog_corr', logEntry.Max_EyeIC_EOG_Corr);
 
         %% save preprocessed dataset
         EEG = pop_saveset(EEG, 'filename', savedSetName, 'filepath', outpath);
@@ -374,6 +486,45 @@ end
 disp('Finished preprocessing.');
 
 %% Local helper functions
+function R = corrMatrix(A, B)
+% Pearson correlation between every row of A and every row of B.
+% A: nA x time, B: nB x time -> R: nA x nB. Toolbox-free.
+    A = double(A);
+    B = double(B);
+    A = A - mean(A, 2);
+    B = B - mean(B, 2);
+    A = A ./ (sqrt(sum(A.^2, 2)) + eps);
+    B = B ./ (sqrt(sum(B.^2, 2)) + eps);
+    R = A * B';
+end
+
+function EEG = appendChannels(EEG, newData, newChanlocs)
+% Append extra channels (data + chanlocs) to the end of an EEG struct,
+% harmonising the chanlocs fields first so the structs can be concatenated.
+    if size(newData, 2) ~= size(EEG.data, 2)
+        error('appendChannels: %d samples to append but the dataset has %d.', ...
+            size(newData, 2), size(EEG.data, 2));
+    end
+
+    fEEG = fieldnames(EEG.chanlocs);
+    fNew = fieldnames(newChanlocs);
+    for k = 1:numel(fEEG)
+        if ~isfield(newChanlocs, fEEG{k})
+            [newChanlocs.(fEEG{k})] = deal([]);
+        end
+    end
+    for k = 1:numel(fNew)
+        if ~isfield(EEG.chanlocs, fNew{k})
+            [EEG.chanlocs.(fNew{k})] = deal([]);
+        end
+    end
+    newChanlocs = orderfields(newChanlocs, fieldnames(EEG.chanlocs));
+
+    EEG.data     = [EEG.data; cast(newData, 'like', EEG.data)];
+    EEG.chanlocs = [EEG.chanlocs(:)', newChanlocs(:)'];
+    EEG.nbchan   = size(EEG.data, 1);
+end
+
 function s = toString(x)
 % column of any table type -> string column
     if isstring(x)
@@ -401,6 +552,7 @@ function T = alignLogTable(T, defaults, LogFile)
 % Bring an existing log file onto the current schema: add missing columns,
 % drop unknown ones (e.g. the old Phase/Condition naming), fix column order
 % and column types so struct2table rows can be appended.
+
     % Migrate the previous naming so old rows keep their meaning:
     % Phase -> PrePost, and the old Condition (EO/EC) -> EyeState. The new
     % Condition/Drug columns are then filled with 'undefined' for those rows.
