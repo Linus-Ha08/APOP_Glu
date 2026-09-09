@@ -42,12 +42,6 @@
 % Recordings shorter than minRecordingSeconds are skipped before any
 % processing and logged with Status 'Skipped' and the measured length.
 %
-% The output mirrors the input BIDS layout inside outpath:
-%   preprocessed_BIDS/sub-<CODE>/ses-day<N>/<pre|post>/<EO|EC>/
-%       sub-<CODE>_ses-day<N>_task-rest<EO|EC>_acq-<pre|post>_eeg_preprocessed.set
-%   plus the matching .fdt. The subfolder is taken from the input folder, and is
-%   cross-checked against the filename entities before the file is processed.
-%
 % returns continuous, cleaned data
 
 %% Initialize
@@ -182,7 +176,7 @@ if isempty(files)
 end
 
 %% Process each file
-for iFile = 1:numel(files)
+for iFile = 1:2      %numel(files)
     rawFile   = files(iFile).name;
     rawFolder = files(iFile).folder;
     fprintf('\nProcessing file %d/%d: %s\n', iFile, numel(files), rawFile);
@@ -196,15 +190,7 @@ for iFile = 1:numel(files)
 
     [~, base_name, ~] = fileparts(rawFile);
     savedSetName = [base_name '_preprocessed.set'];
-
-    % Mirror the input BIDS tree inside outpath:
-    %   preprocessed_BIDS/sub-<CODE>/ses-day<N>/<pre|post>/<EO|EC>/
-    % The subfolder is derived from the INPUT FOLDER rather than rebuilt from the
-    % filename entities, so the output stays a faithful mirror of raw_BIDS. The
-    % two are cross-checked at the top of the try block below.
-    relFolder    = relativeFolder(rawFolder, rawpath);
-    savedSetDir  = fullfile(outpath, relFolder);
-    savedSetPath = fullfile(savedSetDir, savedSetName);
+    savedSetPath = fullfile(outpath, savedSetName);
 
     if exist(savedSetPath, 'file') == 2
         fprintf('File %s already processed. Skipping...\n', savedSetName);
@@ -239,32 +225,6 @@ for iFile = 1:numel(files)
         logEntry.Condition, logEntry.Drug);
 
     try
-        %% folder / filename consistency
-        % The output folder comes from the input FOLDER; Subject/Day/PrePost/
-        % EyeState in the log come from the FILENAME. If the two disagree the
-        % saved dataset would contradict its own log row, so fail the file here
-        % rather than filing it somewhere ambiguous. This is what catches a
-        % recording that was moved by hand without also being renamed.
-        folderTok = regexp(relFolder, ...
-            ['^sub-(?<subject>[^\\/]+)[\\/]ses-day(?<day>\d+)[\\/]' ...
-             '(?<prepost>pre|post)[\\/](?<eyestate>EO|EC)$'], 'names', 'once');
-        if isempty(folderTok)
-            error('APOP:BadFolderLayout', ...
-                ['Input folder ''%s'' does not match the expected ' ...
-                 'sub-<ID>/ses-day<N>/<pre|post>/<EO|EC> layout.'], relFolder);
-        end
-        if ~strcmp(folderTok.subject, tok.subject) || ...
-                str2double(folderTok.day) ~= str2double(tok.day) || ...
-                ~strcmp(folderTok.prepost, tok.prepost) || ...
-                ~strcmp(folderTok.eyestate, tok.eyestate)
-            error('APOP:PathEntityMismatch', ...
-                ['Folder says sub-%s / day %s / %s / %s but the filename says ' ...
-                 'sub-%s / day %s / %s / %s. Rename the recording in raw_data and ' ...
-                 're-run bidsify_apop_glu.py before preprocessing it.'], ...
-                folderTok.subject, folderTok.day, folderTok.prepost, folderTok.eyestate, ...
-                tok.subject, tok.day, tok.prepost, tok.eyestate);
-        end
-
         %% Load raw data
         EEG = pop_loadbv(rawFolder, rawFile);
         EEG.setname = char(logEntry.Subject_ID);
@@ -434,15 +394,18 @@ for iFile = 1:numel(files)
                 rawFile, logEntry.ICA_Rank, EEG.nbchan, logEntry.ICA_Rank);
         end
 
-        rng(42, 'twister');   % deterministic ICA -- reset before every decomposition
         EEG = pop_runica(EEG, 'extended', 1);
         EEG = pop_iclabel(EEG, 'default');
 
         % ICLabel class order: 1 brain, 2 muscle, 3 eye, 4 heart,
         %                      5 line noise, 6 channel noise, 7 other
-        % reject if any prob > 0.6
         ic_probs = EEG.etc.ic_classification.ICLabel.classifications;
 
+        % mark if:  muscle > 50%,
+        %           eye > 50%,
+        %           heart > 50%,
+        %           line noise > 80%,
+        %           channel noise > 50%
         EEG = pop_icflag(EEG, [NaN NaN; ...
                     0.60 1;                 % muscle
                     0.60 1;                 % eye
@@ -567,15 +530,11 @@ for iFile = 1:numel(files)
             'max_eye_ic_eog_corr', logEntry.Max_EyeIC_EOG_Corr);
 
         %% save preprocessed dataset
-        if exist(savedSetDir, 'dir') ~= 7
-            mkdir(savedSetDir);
-        end
-        EEG = pop_saveset(EEG, 'filename', savedSetName, 'filepath', savedSetDir);
+        EEG = pop_saveset(EEG, 'filename', savedSetName, 'filepath', outpath);
 
         logEntry.Status        = string('Success');
         logEntry.Error_Message = string('');
         fprintf('Finished processing file %d/%d: %s\n', iFile, numel(files), rawFile);
-        fprintf('  Saved to %s\n', fullfile(relFolder, savedSetName));
 
     catch ME
         if strcmp(ME.identifier, 'APOP:TooShort')
@@ -598,19 +557,6 @@ end
 disp('Finished preprocessing.');
 
 %% Local helper functions
-function rel = relativeFolder(folder, root)
-% Path of FOLDER relative to ROOT, e.g. 'sub-AK\ses-day1\pre\EO'.
-% Used to mirror the input BIDS tree in the output folder. Case-insensitive
-% because dir() may not return the root spelled exactly as it was given.
-    folder = regexprep(char(folder), '[\\/]+$', '');   % drop trailing separators
-    root   = regexprep(char(root),   '[\\/]+$', '');
-    if numel(folder) < numel(root) || ~strncmpi(folder, root, numel(root))
-        error('APOP:PathOutsideRoot', ...
-            'Folder ''%s'' is not below the raw data root ''%s''.', folder, root);
-    end
-    rel = regexprep(folder(numel(root)+1:end), '^[\\/]+', '');
-end
-
 function R = corrMatrix(A, B)
 % Pearson correlation between every row of A and every row of B.
 % A: nA x time, B: nB x time -> R: nA x nB. Toolbox-free.
