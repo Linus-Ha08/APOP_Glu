@@ -18,9 +18,25 @@
 %   [FIX 3] Permutation p-values use (1 + #>=obs) / (1 + num_perms)
 %       (Phipson & Smyth, 2010) so they can never be exactly zero.
 %
-%   [MINOR] Removed a duplicated channel-lookup block in Section 3; made the
-%       placeholder-row guard in Section 2 crash-safe; preallocated SubIDs
-%       with strings(); added an explicit tiledlayout for the topoplots.
+%   [MINOR] Removed a duplicated channel-lookup block in Section 3; preallocated
+%       SubIDs with strings(); added an explicit tiledlayout for the topoplots.
+%
+%   [FIX 4] The cluster-DEFINING threshold is now its own parameter (cft_p).
+%       It used to be read off `alpha`, so tightening the family-wise level to
+%       0.01 silently redefined which channels form clusters - a different
+%       test, not a stricter one. cft_p and alpha are now independent.
+%
+%   [FIX 5] rng seed set, so a rerun reproduces the same p-values. Without one,
+%       a cluster sitting near alpha can flip between runs.
+%
+%   [FIX 6] The report carries the per-arm N. A surviving cluster from N = 3 and
+%       one from N = 15 used to be indistinguishable in the CSV.
+%
+% INPUT: *_parameterised.mat written by APOP_Glu_Specparam.ipynb, read through
+%   load_parameterised.m - recursive over the BIDS tree, maps eyestate EO/EC to
+%   open/closed, drops sessions with no drug assignment, and errors if any
+%   file's channel labels differ in content or order from the first file's
+%   (the adjacency graph is built once and would otherwise be misaligned).
 %
 % SCOPE: FWER is controlled across all drug conditions and both directions
 %   WITHIN one eyes condition. Eyes-open and eyes-closed are run separately
@@ -42,8 +58,8 @@ eeglab_path = "D:\Linus\MATLAB_applications\eeglab2026.0.0";
 addpath(eeglab_path)
 
 % paths
-inPath  = "D:\Linus\rsEEG\APOP_Glu\SpecParam";
-outPath = "D:\Linus\rsEEG\APOP_Glu\Analysis/CBPT_PrePost_Final";
+inPath  = "D:\Linus\APOP_Glu\parameterised2_BIDS";   % = OUT_ROOT in APOP_Glu_Specparam.ipynb
+outPath = "D:\Linus\APOP_Glu\Analysis\CBPT_PrePost_Final";
 if ~exist(outPath, 'dir')
     mkdir(outPath);
 end
@@ -51,54 +67,31 @@ end
 %%% TARGET CONDITION  (run once with 'open', once with 'closed')
 target_eyes = 'open';
 
+cft_p = 0.05;   % cluster-DEFINING threshold (two-tailed p) - independent of alpha
 alpha = 0.05;   % two-sided family-wise level
+rng(42)         % reproducible permutations
 
-% open empty structure
-all_data = struct('Study', {}, 'Subject', {}, 'UniqueID', {}, 'Drug', {}, 'PrePost', {}, 'Chanlabels', {}, 'Exponent', {});
-
-%% 1. Load Data
-for file = dir(fullfile(inPath, '*_specparam.mat'))'
-    data = load(fullfile(file.folder, file.name));
-
-    Eyes = strtrim(string(data.Eyes));
-    if ~strcmpi(Eyes, target_eyes)
-        continue;
-    end
-
-    % Extract relevant info
-    StudyName  = strtrim(string(data.Study));
-    Subject    = strtrim(string(data.Subject));
-    Drug       = strtrim(string(data.Drug));
-    PrePost    = strtrim(string(data.PrePost));
-    Chanlabels = data.chanlabels;
-    Exponent   = data.exponent_ch;
-
-    % Store, creating a Unique ID to prevent cross-study subject mixing
-    all_data(end+1).Study = StudyName;
-    all_data(end).Subject    = Subject;
-    all_data(end).UniqueID   = StudyName + "_" + Subject;
-    all_data(end).Drug       = Drug;
-    all_data(end).PrePost    = PrePost;
-    all_data(end).Chanlabels = Chanlabels;
-    all_data(end).Exponent   = Exponent;
+%% 1. Load Data (one eyes condition)
+[records, n_nodrug] = load_parameterised(inPath);
+records = records(strcmpi([records.Eyes], target_eyes));
+if isempty(records)
+    error('No %s-eyes recordings found under %s', target_eyes, inPath);
 end
-fprintf("Data loaded. Total entries: %d\n", length(all_data));
+fprintf("Data loaded. %d %s-eyes record(s); %d file(s) dropped for no drug assignment.\n", ...
+    numel(records), target_eyes, n_nodrug);
+
+my_labels = records(1).Chanlabels;
+num_chans = numel(my_labels);
 
 %% 2. Compare pre vs post and compute differences
-% Crash-safe guard against an empty placeholder first row
-if ~isempty(all_data) && isempty(all_data(1).Subject)
-    all_data(1) = [];
-end
+all_uniqueIDs = [records.UniqueID];
+all_drugs     = [records.Drug];
+all_prepost   = [records.PrePost];
 
-all_uniqueIDs = string({all_data.UniqueID});
-all_drugs     = string({all_data.Drug});
-all_prepost   = string({all_data.PrePost});
-
-unique_drugs  = unique(all_drugs);
-unique_drugs(strcmpi(unique_drugs, 'Unknown')) = []; % Clean out 'Unknown'
+unique_drugs  = unique(all_drugs);   % load_parameterised already dropped unassigned drugs
 unique_IDs    = unique(all_uniqueIDs);
 
-diff_data = struct();
+diff_data = struct('UniqueID', {}, 'Drug', {}, 'DiffExp', {});
 diff_idx  = 1;
 
 for d = 1:length(unique_drugs)
@@ -110,7 +103,7 @@ for d = 1:length(unique_drugs)
         idx_post = find(all_uniqueIDs == current_id & all_drugs == current_drug & strcmpi(all_prepost, 'post'));
 
         if ~isempty(idx_pre) && ~isempty(idx_post)
-            diff_exp = all_data(idx_post(1)).Exponent(:) - all_data(idx_pre(1)).Exponent(:);
+            diff_exp = records(idx_post(1)).Exponent(:) - records(idx_pre(1)).Exponent(:);
 
             diff_data(diff_idx).UniqueID = current_id;
             diff_data(diff_idx).Drug     = current_drug;
@@ -130,10 +123,7 @@ end
 
 eeglab nogui;
 
-% Load the channel labels and look up their coordinates
-my_labels = cellstr(all_data(1).Chanlabels);
-num_chans = length(my_labels);
-
+% Look up coordinates for the montage established in Section 1
 chanlocs = struct('labels', my_labels);
 chanlocs = pop_chanedit(chanlocs, 'lookup', master_locs_file);
 
@@ -163,8 +153,7 @@ G_full = graph(adj_mat);
 fprintf('Adjacency matrix built with %d channels.\n', num_chans);
 
 %% 4. Max-Statistic Permutation Engine (synchronized sign-flip)
-num_perms    = 5000;
-alpha_thresh = alpha;
+num_perms = 5000;
 
 % Extract data matrices per drug for fast vectorized computation
 drug_matrices = struct();
@@ -182,8 +171,8 @@ for d = 1:length(unique_drugs)
     end
     drug_matrices(d).D      = D_mat;
     drug_matrices(d).SubIDs = sub_ids;
-    % Two-tailed critical t for CLUSTER FORMATION (free parameter; p<.05)
-    drug_matrices(d).tcrit  = tinv(1 - (alpha_thresh/2), length(idx) - 1);
+    % Two-tailed critical t for CLUSTER FORMATION (cft_p, independent of alpha)
+    drug_matrices(d).tcrit  = tinv(1 - (cft_p/2), length(idx) - 1);
 end
 
 fprintf('Starting permutations (%d iterations)...\n', num_perms);
@@ -257,8 +246,8 @@ close(wb);
 fprintf('Permutations complete.\n');
 
 %% 5. Evaluate Observed Data against the Max-Statistic Distribution
-cbpt_report = table([], [], [], [], [], [], [], ...
-    'VariableNames', {'Drug', 'Direction', 'ClusterMass', 'Omnitest_P_Value', 'NumChannels', 'Channels', 'Cohens_d'});
+cbpt_report = table([], [], [], [], [], [], [], [], ...
+    'VariableNames', {'Drug', 'Direction', 'N', 'ClusterMass', 'Omnitest_P_Value', 'NumChannels', 'Channels', 'Cohens_d'});
 stats_results = struct();
 
 for d = 1:length(drug_matrices)
@@ -293,7 +282,7 @@ for d = 1:length(drug_matrices)
                 sig_channels = [sig_channels, cluster_chans];
                 ch_names = strjoin(my_labels(cluster_chans), ', ');
                 new_row = table(string(drug_matrices(d).Name), string("Increase (Post > Pre)"), ...
-                    cluster_mass, p_val, length(cluster_chans), string(ch_names), cohens_d, ...
+                    drug_matrices(d).N, cluster_mass, p_val, length(cluster_chans), string(ch_names), cohens_d, ...
                     'VariableNames', cbpt_report.Properties.VariableNames);
                 cbpt_report = [cbpt_report; new_row];
             end
@@ -322,7 +311,7 @@ for d = 1:length(drug_matrices)
                 sig_channels = [sig_channels, cluster_chans];
                 ch_names = strjoin(my_labels(cluster_chans), ', ');
                 new_row = table(string(drug_matrices(d).Name), string("Decrease (Post < Pre)"), ...
-                    cluster_mass, p_val, length(cluster_chans), string(ch_names), cohens_d, ...
+                    drug_matrices(d).N, cluster_mass, p_val, length(cluster_chans), string(ch_names), cohens_d, ...
                     'VariableNames', cbpt_report.Properties.VariableNames);
                 cbpt_report = [cbpt_report; new_row];
             end

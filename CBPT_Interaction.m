@@ -19,14 +19,32 @@
 % A subject contributes to a drug only if all four sessions exist for that
 % drug (open/closed x pre/post). Cohen's d_z is a selection-biased descriptor
 % of the cluster, not an unbiased population estimate (Meyer et al., 2021).
+%
+% EXCLUSIONS: nimodipine and placebo are dropped before the family is formed
+%   (see exclude_drugs in Section 1). Dropping placebo removes the only control
+%   for session-order / time-of-day / arousal drift in Delta(EO-EC), so a
+%   surviving cluster cannot be separated from a pure pre-to-post session
+%   effect. Dropping any arm also shrinks the omnibus family, which lowers the
+%   permutation maximum and therefore lowers the p-values of the arms that
+%   remain. The exclusion is not neutral - report it in the methods.
+%
+% INPUT: *_parameterised.mat written by APOP_Glu_Specparam.ipynb, read through
+%   load_parameterised.m - recursive over the BIDS tree, maps eyestate EO/EC to
+%   open/closed, drops sessions with no drug assignment, and errors if any
+%   file's channel labels differ in content or order from the first file's
+%   (the adjacency graph is built once and would otherwise be misaligned).
+%
+% REPORTING: every candidate cluster is written out with its per-arm N and a
+%   Significant flag. The p-value column is P_FWER - already corrected by the
+%   max-statistic null.
 % =========================================================================
 clearvars; close all; clc;
 eeglab_path = "D:\Linus\MATLAB_applications\eeglab2026.0.0";
 addpath(eeglab_path)
 
 % paths
-inPath  = "D:\Linus\rsEEG\APOP_Glu\Data/SpecParam_QC";
-outPath = "D:\Linus\rsEEG\APOP_Glu\Analysis4\CBPT_Interaction_QC";
+inPath  = "D:\Linus\APOP_Glu\parameterised2_BIDS";   % = OUT_ROOT in APOP_Glu_Specparam.ipynb
+outPath = "D:\Linus\APOP_Glu\Analysis4\CBPT_Interaction_QC";
 if ~exist(outPath, 'dir'); mkdir(outPath); end
 
 % --- Thresholds ---
@@ -37,32 +55,21 @@ min_N      = 3;         % minimum subjects required to keep a drug in the family
 rng(42)
 
 %% 1. Load ALL data (both eyes)
-records = struct('Eyes', {}, 'UniqueID', {}, 'Drug', {}, 'PrePost', {}, 'Exponent', {}, 'Chanlabels', {});
-for file = dir(fullfile(inPath, '*_specparam.mat'))'
-    data = load(fullfile(file.folder, file.name));
-    
+% Drugs held out of this analysis. See EXCLUSIONS in the header: this changes
+% both what the test can claim and the p-values of the arms that remain.
+exclude_drugs = ["nimodipine", "placebo"];
 
-    % skip drug conditions 
-    if isfield(data, 'Drug') && lower(strtrim(string(data.Drug))) == "nimodipine"
-        continue; 
-    end
-    if isfield(data, 'Drug') && lower(strtrim(string(data.Drug))) == "placebo"
-        continue; 
-    end
-
-
-    records(end+1).Eyes  = lower(strtrim(string(data.Eyes)));
-    records(end).UniqueID   = strtrim(string(data.Study)) + "_" + strtrim(string(data.Subject));
-    records(end).Drug       = lower(strtrim(string(data.Drug)));
-    records(end).PrePost    = lower(strtrim(string(data.PrePost)));
-    records(end).Exponent   = data.exponent_ch;
-    records(end).Chanlabels = data.chanlabels;
+[records, n_nodrug] = load_parameterised(inPath);
+n_loaded = numel(records);
+records  = records(~ismember([records.Drug], lower(exclude_drugs)));
+if isempty(records)
+    error('Every record was excluded - check exclude_drugs against the data.');
 end
+fprintf(['Loaded %d record(s) (both eyes); %d file(s) dropped for no drug ' ...
+         'assignment; %d excluded (%s).\n'], numel(records), n_nodrug, ...
+         n_loaded - numel(records), strjoin(cellstr(exclude_drugs), ', '));
 
-if isempty(records); error('No *_specparam.mat files loaded from %s', inPath); end
-fprintf('Loaded %d records (both eyes conditions).\n', numel(records));
-
-my_labels = cellstr(records(1).Chanlabels);
+my_labels = records(1).Chanlabels;
 num_chans = numel(my_labels);
 
 %% 2. Build EO - EC per (Subject, Drug, PrePost)
@@ -87,7 +94,6 @@ for i = 1:numel(ukeys)
     eoec(end).EOEC    = (eo - ec)';            % 1 x nChan
 end
 
-eoec = eoec(~([eoec.Drug] == "unknown"));
 if isempty(eoec); error('No EO-EC sessions could be formed (missing open/closed pairs).'); end
 fprintf('Formed %d EO-EC sessions; skipped %d session(s) missing an eyes condition.\n', numel(eoec), n_skip);
 
@@ -174,7 +180,7 @@ end
     "Post > Pre (EO-EC increased)", "Post < Pre (EO-EC decreased)");
 
 % Evaluated against full alpha directly because absolute max covers both tails
-is_sig = arrayfun(@(c) c.PFWER <= alpha, clusters);
+is_sig = arrayfun(@(c) c.P_FWER <= alpha, clusters);
 
 if isempty(clusters)
     fprintf('No candidate clusters formed in any drug.\n');
@@ -256,7 +262,7 @@ function [post_t, post_names, clusters] = run_omnibus_maxstat(drug_matrices, G_f
     end
     
     post_t = cell(nd,1); post_names = strings(nd,1);
-    clusters = struct('Drug', {}, 'Direction', {}, 'ClusterMass', {}, 'Chans', {}, 'PFWER', {}, 'Cohens_d', {}, 'DrugIdx', {});
+    clusters = struct('Drug', {}, 'Direction', {}, 'N', {}, 'ClusterMass', {}, 'Chans', {}, 'P_FWER', {}, 'Cohens_d', {}, 'DrugIdx', {});
     
     for d = 1:nd
         D = drug_matrices(d).D; Nn = drug_matrices(d).N; tcrit = drug_matrices(d).tcrit;
@@ -271,8 +277,8 @@ function [post_t, post_names, clusters] = run_omnibus_maxstat(drug_matrices, G_f
                 pv = (1 + sum(global_max_abs >= abs(cm))) / (1 + num_perms);
                 scd = mean(D(:,cc), 2);
                 % Updated to use dynamic pos_label
-                clusters(end+1) = struct('Drug', drug_matrices(d).Name, 'Direction', pos_label, ...
-                    'ClusterMass', cm, 'Chans', cc, 'PFWER', pv, 'Cohens_d', mean(scd)/std(scd), 'DrugIdx', d);
+                clusters(end+1) = struct('Drug', drug_matrices(d).Name, 'Direction', pos_label, 'N', Nn, ...
+                    'ClusterMass', cm, 'Chans', cc, 'P_FWER', pv, 'Cohens_d', mean(scd)/std(scd), 'DrugIdx', d);
             end
         end
         
@@ -284,48 +290,31 @@ function [post_t, post_names, clusters] = run_omnibus_maxstat(drug_matrices, G_f
                 pv = (1 + sum(global_max_abs >= abs(cm))) / (1 + num_perms);
                 scd = mean(D(:,cc), 2);
                 % Updated to use dynamic neg_label
-                clusters(end+1) = struct('Drug', drug_matrices(d).Name, 'Direction', neg_label, ...
-                    'ClusterMass', cm, 'Chans', cc, 'PFWER', pv, 'Cohens_d', mean(scd)/std(scd), 'DrugIdx', d);
+                clusters(end+1) = struct('Drug', drug_matrices(d).Name, 'Direction', neg_label, 'N', Nn, ...
+                    'ClusterMass', cm, 'Chans', cc, 'P_FWER', pv, 'Cohens_d', mean(scd)/std(scd), 'DrugIdx', d);
             end
         end
     end
 end
 
-function T = build_report_single(clusters, sigflags, my_labels)
-    m = numel(clusters);
-    if m == 0, T = table(); return; end
-    Direction = strings(m,1); ClusterMass = zeros(m,1); RawP = zeros(m,1);
-    Significant = false(m,1); NumChannels = zeros(m,1); Channels = strings(m,1); Cohens_d = zeros(m,1);
-    for k = 1:m
-        Direction(k)   = clusters(k).Direction;
-        ClusterMass(k) = clusters(k).ClusterMass;
-        RawP(k)        = clusters(k).RawP;
-        Significant(k) = sigflags(k);
-        NumChannels(k) = numel(clusters(k).Chans);
-        Channels(k)    = strjoin(my_labels(clusters(k).Chans), ', ');
-        Cohens_d(k)    = clusters(k).Cohens_d;
-    end
-    T = table(Direction, ClusterMass, RawP, Significant, NumChannels, Channels, Cohens_d);
-    T = sortrows(T, 'RawP');
-end
-
 function T = build_report_omnibus(clusters, is_sig, my_labels)
     m = numel(clusters);
     if m == 0, T = table(); return; end
-    Drug = strings(m,1); Direction = strings(m,1); ClusterMass = zeros(m,1);
+    Drug = strings(m,1); Direction = strings(m,1); N = zeros(m,1); ClusterMass = zeros(m,1);
     P_FWER = zeros(m,1); Significant = false(m,1);
     NumChannels = zeros(m,1); Channels = strings(m,1); Cohens_d = zeros(m,1);
     for k = 1:m
         Drug(k)        = clusters(k).Drug;
         Direction(k)   = clusters(k).Direction;
+        N(k)           = clusters(k).N;
         ClusterMass(k) = clusters(k).ClusterMass;
-        P_FWER(k)      = clusters(k).PFWER;
+        P_FWER(k)      = clusters(k).P_FWER;
         Significant(k) = is_sig(k);
         NumChannels(k) = numel(clusters(k).Chans);
         Channels(k)    = strjoin(my_labels(clusters(k).Chans), ', ');
         Cohens_d(k)    = clusters(k).Cohens_d;
     end
-    T = table(Drug, Direction, ClusterMass, P_FWER, Significant, NumChannels, Channels, Cohens_d);
+    T = table(Drug, Direction, N, ClusterMass, P_FWER, Significant, NumChannels, Channels, Cohens_d);
     T = sortrows(T, 'P_FWER');
 end
 
