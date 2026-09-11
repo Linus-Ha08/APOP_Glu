@@ -58,8 +58,8 @@ eeglab_path = "D:\Linus\MATLAB_applications\eeglab2026.0.0";
 addpath(eeglab_path)
 
 % paths
-inPath  = "D:\Linus\APOP_Glu\parameterised2_BIDS";   % = OUT_ROOT in APOP_Glu_Specparam.ipynb
-outPath = "D:\Linus\APOP_Glu\Analysis\CBPT_PrePost_Final";
+inPath  = "D:\Linus\APOP_Glu\parameterised_BIDS";   % = OUT_ROOT in APOP_Glu_Specparam.ipynb
+outPath = "D:\Linus\APOP_Glu\CBPT_PrePost";
 if ~exist(outPath, 'dir')
     mkdir(outPath);
 end

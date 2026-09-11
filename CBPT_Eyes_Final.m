@@ -65,8 +65,8 @@ eeglab_path = "D:\Linus\MATLAB_applications\eeglab2026.0.0";
 addpath(eeglab_path)
 
 % paths
-inPath  = "D:\Linus\APOP_Glu\parameterised2_BIDS";   % = OUT_ROOT in APOP_Glu_Specparam.ipynb
-outPath = "D:\Linus\APOP_Glu\Analysis1\CBPT_Eyes_QC";
+inPath  = "D:\Linus\APOP_Glu\parameterised_BIDS";   % = OUT_ROOT in APOP_Glu_Specparam.ipynb
+outPath = "D:\Linus\APOP_Glu\CBPT_eyes";
 if ~exist(outPath, 'dir'); mkdir(outPath); end
 
 % --- Conditions (must match the Drug column of APOP_Glu_Conditions.csv) ---
