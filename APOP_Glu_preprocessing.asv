@@ -60,7 +60,7 @@ clear; clc;
 eeglabRoot  = 'D:\Linus\MATLAB_applications\eeglab2026.0.0';
 ICLabelRoot = 'D:\Linus\MATLAB_applications\eeglab2026.0.0\plugins\ICLabel';
 rawpath     = 'D:\Linus\APOP_Glu\raw_BIDS';
-outpath     = 'D:\Linus\APOP_Glu\preprocessed_2_BIDS';
+outpath     = 'D:\Linus\APOP_Glu\preprocessed_BIDS';
 
 % Recordings shorter than this are skipped, not preprocessed. Below ~32 s
 % zapline-plus errors out in findpeaks (segmentLength 1 s vs minChunkLength 30),
@@ -379,8 +379,7 @@ for iFile = 1:numel(files)
         chans_before_clean   = {EEG.chanlocs.labels};
 
         % clean data
-        % NOTE: settings    (1) Burst rejection off; BurstCriterion 20
-        %                   (2) Burst rejection on ; BurstCriterion 30
+        % NOTE: settings    (1) Burst rejection off; Burst
         EEG = pop_clean_rawdata(EEG, ...
             'FlatlineCriterion', 5, ...     % reject chans if flat > 5 s
             'ChannelCriterion', 0.8, ...    % bad if chan correlated less than this to own reconstruction based on other chans; default = 0.8
